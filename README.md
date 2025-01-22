@@ -14,4 +14,4 @@ Build and load the kernel module:
 $ cd src && make && sudo insmod ryzen_metrics.ko
 ```
 
-You will find the metrics in `/sys/devices/system/cpu/ryzen-metrics` and `/sys/devices/system/cpu/cpu*/ryzen-metrics`.
+You will find the metrics for each CPU under `/sys/devices/system/cpu/ryzen-metrics`.
