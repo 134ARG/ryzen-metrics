@@ -83,7 +83,6 @@ struct kobject **cpu_kobjs = NULL;
 static int __init effective_freq_init(void) {
   int cpu, ret;
   struct device *cpu_dev;
-  // struct kobject *metrics_kobj;
 
   struct device *dev_root;
   dev_root = bus_get_dev_root(&cpu_subsys);
@@ -123,15 +122,8 @@ static int __init effective_freq_init(void) {
       continue;
     }
 
-    // // Create a directory named "monitor" under /sys/devices/system/cpu/cpuX/
-    // metrics_kobj = kobject_create_and_add("ryzen_metrics", &cpu_dev->kobj);
-    // if (!metrics_kobj) {
-    //   pr_err("Failed to create 'ryzen_metrics' directory for CPU %d\n", cpu);
-    //   continue;
-    // }
-
     // Create the effective_freq file under
-    // /sys/devices/system/cpu/cpuX/ryzen_metrics/
+    // /sys/devices/system/cpu/ryzen_metrics/
     ret = sysfs_create_file(cpu_kobjs[cpu], &effective_freq_attr.attr);
     if (ret) {
       pr_err("Failed to create effective_freq file for CPU %d\n", cpu);
@@ -159,19 +151,10 @@ static void __exit effective_freq_exit(void) {
       continue;
     }
 
-    // // Get the ryzen_metrics kobject (parent of cpu_dev kobject)
-    // metrics_kobj = kset_find_obj(cpu_dev->kobj.kset, "ryzen_metrics");
-    // if (!metrics_kobj) {
-    //     pr_err("No ryzen_metrics kobject found for CPU %d during cleanup\n",
-    //     cpu); continue;
-    // }
-
     // Remove the effective_freq file
     sysfs_remove_file(cpu_kobjs[cpu], &effective_freq_attr.attr);
 
-    // Decrement the reference count and release the kobject
-    // kobject_put(metrics_kobj);
-    // pr_info("Released ryzen_metrics kobject for CPU %d\n", cpu);
+    // Decrement the reference count
     kobject_put(cpu_kobjs[cpu]);
   }
   kfree(cpu_kobjs); // Free the allocated memory
@@ -184,4 +167,5 @@ module_exit(effective_freq_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("134ARG");
-MODULE_DESCRIPTION("A kernel module to expose per-CPU metrics via sysfs");
+MODULE_DESCRIPTION(
+    "A kernel module to expose AMD Ryzen's per-CPU metrics via sysfs");
