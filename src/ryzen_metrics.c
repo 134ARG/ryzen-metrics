@@ -1,6 +1,9 @@
+#include "asm-generic/errno.h"
 #include "asm/paravirt.h"
 #include "asm/tsc.h"
 #include "linux/device/bus.h"
+#include "linux/printk.h"
+#include "linux/types.h"
 #include <asm/msr.h>
 #include <asm/processor.h>
 #include <linux/cpu.h>
@@ -10,11 +13,106 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/sysfs.h>
 
 #define MSR_MPERF 0xE7
 #define MSR_APERF 0xE8
+
+struct cpu_kobject {
+  struct kobject kobj;
+  int cpuid;
+  struct list_head list;
+};
+
+struct cpu_kobject_attribute {
+  struct attribute attr;
+  ssize_t (*show)(struct cpu_kobject *, struct cpu_kobject_attribute *, char *);
+  ssize_t (*store)(struct cpu_kobject *, struct cpu_kobject_attribute *,
+                   const char *, size_t);
+};
+
+static void cpu_kobj_release(struct kobject *kobj) {
+  struct cpu_kobject *cpu = container_of(kobj, struct cpu_kobject, kobj);
+  list_del(&cpu->list);
+  kfree(cpu);
+}
+
+#define to_cpu_kobj_attr(x) container_of(x, struct cpu_kobject_attribute, attr)
+#define to_cpu_kobj(x) container_of(x, struct cpu_kobject, kobj)
+
+static struct kobject *metrics_kobj = NULL;
+static LIST_HEAD(cpu_kobj_list);
+
+static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf) {
+  struct cpu_kobject *cpu_kobj;
+  struct cpu_kobject_attribute *attribute;
+
+  cpu_kobj = to_cpu_kobj(kobj);
+  attribute = to_cpu_kobj_attr(attr);
+
+  if (!attribute->show)
+    return -EIO;
+
+  return attribute->show(cpu_kobj, attribute, buf);
+}
+
+static ssize_t store(struct kobject *kobj, struct attribute *attr,
+                     const char *buf, size_t len) {
+  struct cpu_kobject *cpu_kobj;
+  struct cpu_kobject_attribute *attribute;
+
+  cpu_kobj = to_cpu_kobj(kobj);
+  attribute = to_cpu_kobj_attr(attr);
+
+  if (!attribute->store)
+    return -EIO;
+
+  return attribute->store(cpu_kobj, attribute, buf, len);
+}
+
+static const struct sysfs_ops sysfs_ops = {
+    .show = show,
+    .store = store,
+};
+
+static struct kobj_type cpu_ktype = {
+    .sysfs_ops = &sysfs_ops,
+    .release = cpu_kobj_release,
+};
+
+static int add_cpu_kobject(int cpuid, struct cpu_kobject **ptr) {
+  if (!metrics_kobj) {
+    pr_err("ryzen_metrics: parent kobject not initialized\n");
+    return -ENAVAIL;
+  }
+
+  struct cpu_kobject *cpu_obj = kzalloc(sizeof(struct cpu_kobject), GFP_KERNEL);
+  if (!cpu_obj) {
+    return -ENOMEM;
+  }
+  cpu_obj->cpuid = cpuid;
+  if (kobject_init_and_add(&cpu_obj->kobj, &cpu_ktype, metrics_kobj, "cpu%d",
+                           cpuid)) {
+    kobject_put(&cpu_obj->kobj); // Cleanup on failure
+    return -EINVAL;
+  }
+
+  // Add to the linked list
+  list_add_tail(&cpu_obj->list, &cpu_kobj_list);
+  *ptr = cpu_obj;
+
+  pr_info("CPU kobject for CPU %d added\n", cpuid);
+  return 0;
+}
+
+static void cleanup_all_cpu_kobjects(void) {
+  struct cpu_kobject *cpu, *tmp;
+  list_for_each_entry_safe(cpu, tmp, &cpu_kobj_list, list) {
+    kobject_put(&cpu->kobj);
+  }
+}
 
 static void freq_callback(void *freq) {
   uint64_t *effective_freq = (uint64_t *)freq;
@@ -52,18 +150,14 @@ static int calculate_effective_freq(int cpu, uint64_t *effective_freq) {
 }
 
 // Sysfs show function for effective frequency
-static ssize_t effective_freq_show(struct kobject *kobj,
-                                   struct kobj_attribute *attr, char *buf) {
+static ssize_t effective_freq_show(struct cpu_kobject *kobj,
+                                   struct cpu_kobject_attribute *attr,
+                                   char *buf) {
   int cpu, ret;
   uint64_t effective_freq;
 
-  // Extract the CPU ID from the kobject's name
-  ret = kstrtoint(kobj->name + 3, 10, &cpu); // Extract "cpuX" -> X
-  if (ret) {
-    pr_err("ryzen_metrics: failed to extract cpu id from: %s\n",
-           kobj->parent->name);
-    return ret;
-  }
+  // Extract the CPU ID from the kobject
+  cpu = kobj->cpuid;
 
   ret = calculate_effective_freq(cpu, &effective_freq);
   if (ret) {
@@ -74,33 +168,27 @@ static ssize_t effective_freq_show(struct kobject *kobj,
 }
 
 // Per-CPU sysfs attribute
-static struct kobj_attribute effective_freq_attr = __ATTR_RO(effective_freq);
-
-struct kobject *metrics_kobj = NULL;
-struct kobject **cpu_kobjs = NULL;
+static struct cpu_kobject_attribute effective_freq_attr =
+    __ATTR_RO(effective_freq);
 
 // Module initialization
-static int __init effective_freq_init(void) {
-  int cpu, ret;
+static int __init ryzen_metrics_init(void) {
+  int cpu;
   struct device *cpu_dev;
 
   struct device *dev_root;
   dev_root = bus_get_dev_root(&cpu_subsys);
-  if (dev_root) {
-    metrics_kobj = kobject_create_and_add("ryzen_metrics", &dev_root->kobj);
-    put_device(dev_root);
-    if (metrics_kobj == NULL) {
-      pr_err("ryzen_metrics: failed to create ryzen_metrics kobject\n");
-      return -ENOMEM;
-    }
-  } else {
+
+  if (!dev_root) {
     pr_err("ryzen_metrics: failed to get root device!\n");
-    return -ENOMEM;
+    return -EINVAL;
   }
 
-  cpu_kobjs = kmalloc(num_online_cpus() * sizeof(struct kobject *), GFP_KERNEL);
-  if (cpu_kobjs == NULL) {
-    pr_err("ryzen_metrics: failed to allocate memory for cpu_kobjs\n");
+  metrics_kobj = kobject_create_and_add("ryzen_metrics", &dev_root->kobj);
+  put_device(dev_root);
+  if (metrics_kobj == NULL) {
+    pr_err("ryzen_metrics: failed to create ryzen_metrics kobject\n");
+    cleanup_all_cpu_kobjects();
     kobject_put(metrics_kobj);
     return -ENOMEM;
   }
@@ -113,21 +201,23 @@ static int __init effective_freq_init(void) {
       continue;
     }
 
-    // Allocate memory for a new kobject and initialize it with cpu_dev's name
-    cpu_kobjs[cpu] = kobject_create_and_add(cpu_dev->kobj.name, metrics_kobj);
-    if (!cpu_kobjs[cpu]) {
-      pr_err("ryzen_metrics: failed to create directory for CPU %d under "
-             "'ryzen_metrics'\n",
-             cpu);
-      continue;
+    struct cpu_kobject *cpu_obj = NULL;
+    int ret = add_cpu_kobject(cpu, &cpu_obj);
+    if (ret) {
+      pr_err("ryzen_metrics: failed to create CPU %d kobject\n", cpu);
+      cleanup_all_cpu_kobjects();
+      kobject_put(metrics_kobj);
+      return ret;
     }
 
     // Create the effective_freq file under
-    // /sys/devices/system/cpu/ryzen_metrics/
-    ret = sysfs_create_file(cpu_kobjs[cpu], &effective_freq_attr.attr);
+    // /sys/devices/system/cpu/ryzen_metrics/cpuX/
+    ret = sysfs_create_file(&cpu_obj->kobj, &effective_freq_attr.attr);
     if (ret) {
       pr_err("Failed to create effective_freq file for CPU %d\n", cpu);
-      continue;
+      cleanup_all_cpu_kobjects();
+      kobject_put(metrics_kobj);
+      return ret;
     }
   }
 
@@ -136,34 +226,19 @@ static int __init effective_freq_init(void) {
 }
 
 // Module exit
-static void __exit effective_freq_exit(void) {
-  int cpu;
-  struct device *cpu_dev;
-  // struct kobject *metrics_kobj;
-
-  pr_info("Unloading Effective Frequency module...\n");
-
-  for_each_online_cpu(cpu) {
-    // Get the device for the current CPU
-    cpu_dev = get_cpu_device(cpu);
-    if (!cpu_dev) {
-      pr_err("Failed to get device for CPU %d during cleanup\n", cpu);
-      continue;
-    }
-
-    // Remove the effective_freq file
-    sysfs_remove_file(cpu_kobjs[cpu], &effective_freq_attr.attr);
-
-    // Decrement the reference count
-    kobject_put(cpu_kobjs[cpu]);
+static void __exit ryzen_metrics_exit(void) {
+  struct cpu_kobject *cpu_obj, *tmp;
+  list_for_each_entry_safe(cpu_obj, tmp, &cpu_kobj_list, list) {
+    sysfs_remove_file(&cpu_obj->kobj, &effective_freq_attr.attr);
   }
-  kfree(cpu_kobjs); // Free the allocated memory
+
+  cleanup_all_cpu_kobjects();
   kobject_put(metrics_kobj);
   pr_info("Effective Frequency module successfully unloaded\n");
 }
 
-module_init(effective_freq_init);
-module_exit(effective_freq_exit);
+module_init(ryzen_metrics_init);
+module_exit(ryzen_metrics_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("134ARG");
