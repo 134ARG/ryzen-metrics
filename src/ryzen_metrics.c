@@ -140,18 +140,25 @@ static int calculate_effective_freq(int cpu, uint64_t *effective_freq) {
   struct truncated_perf_value perf_values_start = {0}, perf_values_end = {0};
   int ret = 0;
   int retry_count = 3;
+
+  uint64_t mperf_diff = 1;
+  uint64_t aperf_diff = 0;
+
   while (retry_count > 0) {
     if ((ret = smp_call_function_single(cpu, freq_callback, &perf_values_start,
                                         true))) {
       pr_err("ryzen_metrics: the cpu id is invalid: %d\n", cpu);
       return ret;
     }
+
     msleep(5);
+
     if ((ret = smp_call_function_single(cpu, freq_callback, &perf_values_end,
                                         true))) {
       pr_err("ryzen_metrics: the cpu id is invalid: %d\n", cpu);
       return ret;
     }
+
     uint64_t mperf_start = perf_values_start.mperf;
     uint64_t mperf_end = perf_values_end.mperf;
     uint64_t aperf_start = perf_values_start.aperf;
@@ -160,21 +167,21 @@ static int calculate_effective_freq(int cpu, uint64_t *effective_freq) {
             "value: %llu, aperf end value: %llu\n",
             mperf_start, mperf_end, aperf_start, aperf_end);
 
-    if (mperf_start > mperf_end || aperf_start > aperf_end) {
+    mperf_diff = mperf_end - mperf_start;
+    aperf_diff = aperf_end - aperf_start;
+
+    if (mperf_start >= mperf_end || aperf_start >= aperf_end) {
       pr_info("ryzen_metrics: overflow encountered. retrying...");
       retry_count--;
       continue;
     }
-    uint64_t mperf_diff = mperf_end - mperf_start;
-    uint64_t aperf_diff = aperf_end - aperf_start;
+
     pr_info("mperf diff: %llu, aperf diff: %llu\n", mperf_diff, aperf_diff);
     break;
   }
 
-  *effective_freq =
-      (perf_values_end.aperf - perf_values_start.aperf) * (tsc_khz / 1000) /
-      (perf_values_end.mperf -
-       perf_values_start.mperf); // Calculate effective frequency in MHz
+  *effective_freq = (aperf_diff) * (tsc_khz / 1000) /
+                    (mperf_diff); // Calculate effective frequency in MHz
 
   return 0;
 }
@@ -200,6 +207,58 @@ static ssize_t effective_freq_show(struct cpu_kobject *kobj,
 // Per-CPU sysfs attribute
 static struct cpu_kobject_attribute effective_freq_attr =
     __ATTR_RO(effective_freq);
+
+#define MSR_PWR_UNIT 0xC0010299
+#define MSR_CORE_ENERGY 0xC001029A
+#define MSR_PACKAGE_ENERGY 0xC001029B
+
+#define POOLING_INTERVAL_MS 10
+#define ENERGY_MUTLIPLIER (1000 * 1000 / POOLING_INTERVAL_MS)
+
+struct rapl_power_unit {
+  uint8_t power_unit : 8;
+  uint8_t energy_unit : 8;
+  uint8_t time_unit : 8;
+  uint64_t _ : 40;
+};
+
+static ssize_t core_power_show(struct cpu_kobject *kobj,
+                               struct cpu_kobject_attribute *attr, char *buf) {
+  struct rapl_power_unit power_unit;
+  int cpuid = kobj->cpuid;
+  int ret;
+  if ((ret =
+           rdmsrl_safe_on_cpu(cpuid, MSR_PWR_UNIT, (uint64_t *)&power_unit))) {
+    pr_alert("ryzen_metrics: Failed to read power unit");
+    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+  }
+
+  uint64_t inverse_energy_unit_d = (1llu << power_unit.energy_unit);
+  uint64_t raw_core_energy_begin = 0, raw_core_energy_end = 0;
+
+  if ((ret = rdmsrl_safe_on_cpu(cpuid, MSR_CORE_ENERGY,
+                                &raw_core_energy_begin))) {
+    pr_alert("ryzen_metrics: Failed to read core energy");
+    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+  }
+
+
+  msleep(POOLING_INTERVAL_MS);
+
+  if ((ret =
+           rdmsrl_safe_on_cpu(cpuid, MSR_CORE_ENERGY, &raw_core_energy_end))) {
+    pr_alert("ryzen_metrics: Failed to read core energy");
+    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+  }
+
+  uint64_t core_power_in_mw = 0;
+  core_power_in_mw = (raw_core_energy_end - raw_core_energy_begin) * ENERGY_MUTLIPLIER /
+                     inverse_energy_unit_d;
+
+  return scnprintf(buf, PAGE_SIZE, "%llu\n", core_power_in_mw);
+}
+
+static struct cpu_kobject_attribute core_power_attr = __ATTR_RO(core_power);
 
 // Module initialization
 static int __init ryzen_metrics_init(void) {
@@ -245,6 +304,14 @@ static int __init ryzen_metrics_init(void) {
     ret = sysfs_create_file(&cpu_obj->kobj, &effective_freq_attr.attr);
     if (ret) {
       pr_err("Failed to create effective_freq file for CPU %d\n", cpu);
+      cleanup_all_cpu_kobjects();
+      kobject_put(metrics_kobj);
+      return ret;
+    }
+
+    ret = sysfs_create_file(&cpu_obj->kobj, &core_power_attr.attr);
+    if (ret) {
+      pr_err("Failed to create core_power file for CPU %d\n", cpu);
       cleanup_all_cpu_kobjects();
       kobject_put(metrics_kobj);
       return ret;
