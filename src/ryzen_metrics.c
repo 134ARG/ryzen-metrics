@@ -114,36 +114,21 @@ static void cleanup_all_cpu_kobjects(void) {
   }
 }
 
+struct truncated_perf_value {
+  uint64_t mperf;
+  uint64_t aperf;
+};
+
 static void freq_callback(void *freq) {
-  uint64_t *effective_freq = (uint64_t *)freq;
-  uint64_t mperf_start = 0, mperf_end = 0;
-  uint64_t aperf_start = 0, aperf_end = 0;
+  struct truncated_perf_value *perf_values =
+      (struct truncated_perf_value *)freq;
+  uint64_t mperf = 0;
+  uint64_t aperf = 0;
 
-  int retry_count = 3;
-
-  while (retry_count) {
-    // avoid interference with scheduler
-    rdmsrl(MSR_MPERF, mperf_start); // Read the end value of MPERF
-    rdmsrl(MSR_APERF, aperf_start); // Read the end value of APERF
-
-    mdelay(5); // Wait for 5 milliseconds
-
-    rdmsrl(MSR_MPERF, mperf_end); // Read the end value of MPERF
-    rdmsrl(MSR_APERF, aperf_end); // Read the end value of APERF
-    pr_info("mperf start value: %llu, mperf end value: %llu, aperf start "
-            "value: %llu, aperf end value: %llu\n",
-            mperf_start, mperf_end, aperf_start, aperf_end);
-
-    if (mperf_end < mperf_start || aperf_end < aperf_start) {
-      pr_info("ryzen_metrics: overflow encountered. retrying...");
-      retry_count--;
-      continue;
-    }
-    break;
-  }
-
-  *effective_freq = aperf_end * (tsc_khz / 1000) /
-                    mperf_end; // Calculate effective frequency in MHz
+  rdmsrl(MSR_MPERF, mperf); // Read the end value of MPERF
+  rdmsrl(MSR_APERF, aperf); // Read the end value of APERF
+  perf_values->mperf = mperf;
+  perf_values->aperf = aperf;
 }
 
 // Function to calculate effective frequency for a given CPU
@@ -152,12 +137,44 @@ static int calculate_effective_freq(int cpu, uint64_t *effective_freq) {
     pr_err("ryzen_metrics: the cpu id is invalid: %d\n", cpu);
     return -EINVAL;
   }
+  struct truncated_perf_value perf_values_start = {0}, perf_values_end = {0};
   int ret = 0;
-  if ((ret = smp_call_function_single(cpu, freq_callback, effective_freq,
-                                      true))) {
-    pr_err("ryzen_metrics: the cpu id is invalid: %d\n", cpu);
-    return ret;
+  int retry_count = 3;
+  while (retry_count > 0) {
+    if ((ret = smp_call_function_single(cpu, freq_callback, &perf_values_start,
+                                        true))) {
+      pr_err("ryzen_metrics: the cpu id is invalid: %d\n", cpu);
+      return ret;
+    }
+    msleep(5);
+    if ((ret = smp_call_function_single(cpu, freq_callback, &perf_values_end,
+                                        true))) {
+      pr_err("ryzen_metrics: the cpu id is invalid: %d\n", cpu);
+      return ret;
+    }
+    uint64_t mperf_start = perf_values_start.mperf;
+    uint64_t mperf_end = perf_values_end.mperf;
+    uint64_t aperf_start = perf_values_start.aperf;
+    uint64_t aperf_end = perf_values_end.aperf;
+    pr_info("mperf start value: %llu, mperf end value: %llu, aperf start "
+            "value: %llu, aperf end value: %llu\n",
+            mperf_start, mperf_end, aperf_start, aperf_end);
+
+    if (mperf_start > mperf_end || aperf_start > aperf_end) {
+      pr_info("ryzen_metrics: overflow encountered. retrying...");
+      retry_count--;
+      continue;
+    }
+    uint64_t mperf_diff = mperf_end - mperf_start;
+    uint64_t aperf_diff = aperf_end - aperf_start;
+    pr_info("mperf diff: %llu, aperf diff: %llu\n", mperf_diff, aperf_diff);
+    break;
   }
+
+  *effective_freq =
+      (perf_values_end.aperf - perf_values_start.aperf) * (tsc_khz / 1000) /
+      (perf_values_end.mperf -
+       perf_values_start.mperf); // Calculate effective frequency in MHz
 
   return 0;
 }
