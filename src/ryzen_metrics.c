@@ -222,47 +222,75 @@ struct rapl_power_unit {
   uint64_t _ : 40;
 };
 
-static ssize_t core_power_show(struct cpu_kobject *kobj,
-                               struct cpu_kobject_attribute *attr, char *buf) {
+static int calculate_power(int cpuid, uint64_t source_reg,
+                           uint64_t *power_in_mw) {
   struct rapl_power_unit power_unit;
-  int cpuid = kobj->cpuid;
   int ret;
   if ((ret =
            rdmsrl_safe_on_cpu(cpuid, MSR_PWR_UNIT, (uint64_t *)&power_unit))) {
     pr_alert("ryzen_metrics: Failed to read power unit");
-    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+    return ret;
   }
 
   uint64_t inverse_energy_unit_d = (1llu << power_unit.energy_unit);
   uint64_t raw_core_energy_begin = 0, raw_core_energy_end = 0;
 
-  if ((ret = rdmsrl_safe_on_cpu(cpuid, MSR_CORE_ENERGY,
-                                &raw_core_energy_begin))) {
+  if ((ret = rdmsrl_safe_on_cpu(cpuid, source_reg, &raw_core_energy_begin))) {
     pr_alert("ryzen_metrics: Failed to read core energy");
-    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+    return ret;
   }
-
 
   msleep(POOLING_INTERVAL_MS);
 
-  if ((ret =
-           rdmsrl_safe_on_cpu(cpuid, MSR_CORE_ENERGY, &raw_core_energy_end))) {
+  if ((ret = rdmsrl_safe_on_cpu(cpuid, source_reg, &raw_core_energy_end))) {
     pr_alert("ryzen_metrics: Failed to read core energy");
-    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+    return ret;
   }
 
+  *power_in_mw = (raw_core_energy_end - raw_core_energy_begin) *
+                 ENERGY_MUTLIPLIER / inverse_energy_unit_d;
+
+  return 0;
+}
+
+static ssize_t core_power_show(struct cpu_kobject *kobj,
+                               struct cpu_kobject_attribute *attr, char *buf) {
+  int cpuid = kobj->cpuid;
+  int ret;
+
   uint64_t core_power_in_mw = 0;
-  core_power_in_mw = (raw_core_energy_end - raw_core_energy_begin) * ENERGY_MUTLIPLIER /
-                     inverse_energy_unit_d;
+
+  if ((ret = calculate_power(cpuid, MSR_CORE_ENERGY, &core_power_in_mw))) {
+    pr_alert("ryzen_metrics: Failed to calculate the power");
+    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+  }
 
   return scnprintf(buf, PAGE_SIZE, "%llu\n", core_power_in_mw);
 }
 
 static struct cpu_kobject_attribute core_power_attr = __ATTR_RO(core_power);
 
+static ssize_t package_power_show(struct cpu_kobject *kobj,
+                                  struct cpu_kobject_attribute *attr,
+                                  char *buf) {
+  int ret;
+
+  uint64_t core_power_in_mw = 0;
+
+  if ((ret = calculate_power(0, MSR_PACKAGE_ENERGY, &core_power_in_mw))) {
+    pr_alert("ryzen_metrics: Failed to calculate the power");
+    return scnprintf(buf, PAGE_SIZE, "Error: %d\n", ret);
+  }
+
+  return scnprintf(buf, PAGE_SIZE, "%llu\n", core_power_in_mw);
+}
+
+static struct cpu_kobject_attribute package_power_attr =
+    __ATTR_RO(package_power);
+
 // Module initialization
 static int __init ryzen_metrics_init(void) {
-  int cpu;
+  int cpu, ret;
   struct device *cpu_dev;
 
   struct device *dev_root;
@@ -282,6 +310,14 @@ static int __init ryzen_metrics_init(void) {
     return -ENOMEM;
   }
 
+  ret = sysfs_create_file(metrics_kobj, &package_power_attr.attr);
+  if (ret) {
+    pr_err("Failed to create package_power file for CPU\n");
+    cleanup_all_cpu_kobjects();
+    kobject_put(metrics_kobj);
+    return ret;
+  }
+
   for_each_online_cpu(cpu) {
     // Get the device for the current CPU
     cpu_dev = get_cpu_device(cpu);
@@ -291,7 +327,7 @@ static int __init ryzen_metrics_init(void) {
     }
 
     struct cpu_kobject *cpu_obj = NULL;
-    int ret = add_cpu_kobject(cpu, &cpu_obj);
+    ret = add_cpu_kobject(cpu, &cpu_obj);
     if (ret) {
       pr_err("ryzen_metrics: failed to create CPU %d kobject\n", cpu);
       cleanup_all_cpu_kobjects();
@@ -327,10 +363,13 @@ static void __exit ryzen_metrics_exit(void) {
   struct cpu_kobject *cpu_obj, *tmp;
   list_for_each_entry_safe(cpu_obj, tmp, &cpu_kobj_list, list) {
     sysfs_remove_file(&cpu_obj->kobj, &effective_freq_attr.attr);
+    sysfs_remove_file(&cpu_obj->kobj, &core_power_attr.attr);
   }
-
   cleanup_all_cpu_kobjects();
+
+  sysfs_remove_file(metrics_kobj, &package_power_attr.attr);
   kobject_put(metrics_kobj);
+
   pr_info("Effective Frequency module successfully unloaded\n");
 }
 
