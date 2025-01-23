@@ -116,18 +116,31 @@ static void cleanup_all_cpu_kobjects(void) {
 
 static void freq_callback(void *freq) {
   uint64_t *effective_freq = (uint64_t *)freq;
-  uint64_t mperf_end = 0;
-  uint64_t aperf_end = 0;
+  uint64_t mperf_start = 0, mperf_end = 0;
+  uint64_t aperf_start = 0, aperf_end = 0;
 
-  wrmsrl(MSR_MPERF, 0);
-  wrmsrl(MSR_APERF, 0);
+  int retry_count = 3;
 
-  mdelay(10); // Wait for 10 milliseconds
+  while (retry_count) {
+    // avoid interference with scheduler
+    rdmsrl(MSR_MPERF, mperf_start); // Read the end value of MPERF
+    rdmsrl(MSR_APERF, aperf_start); // Read the end value of APERF
 
-  rdmsrl(MSR_MPERF, mperf_end); // Read the end value of MPERF
-  rdmsrl(MSR_APERF, aperf_end); // Read the end value of APERF
-  pr_info("mperf end value: %llu, aperf end value: %llu\n", mperf_end,
-          aperf_end);
+    mdelay(5); // Wait for 5 milliseconds
+
+    rdmsrl(MSR_MPERF, mperf_end); // Read the end value of MPERF
+    rdmsrl(MSR_APERF, aperf_end); // Read the end value of APERF
+    pr_info("mperf start value: %llu, mperf end value: %llu, aperf start "
+            "value: %llu, aperf end value: %llu\n",
+            mperf_start, mperf_end, aperf_start, aperf_end);
+
+    if (mperf_end < mperf_start || aperf_end < aperf_start) {
+      pr_info("ryzen_metrics: overflow encountered. retrying...");
+      retry_count--;
+      continue;
+    }
+    break;
+  }
 
   *effective_freq = aperf_end * (tsc_khz / 1000) /
                     mperf_end; // Calculate effective frequency in MHz
