@@ -212,7 +212,7 @@ static struct cpu_kobject_attribute effective_freq_attr =
 #define MSR_CORE_ENERGY 0xC001029A
 #define MSR_PACKAGE_ENERGY 0xC001029B
 
-#define POOLING_INTERVAL_MS 10
+#define POOLING_INTERVAL_MS 50
 #define ENERGY_MUTLIPLIER (1000 * 1000 / POOLING_INTERVAL_MS)
 
 struct rapl_power_unit {
@@ -232,7 +232,6 @@ static int calculate_power(int cpuid, uint64_t source_reg,
     return ret;
   }
 
-  uint64_t inverse_energy_unit_d = (1llu << power_unit.energy_unit);
   uint64_t raw_core_energy_begin = 0, raw_core_energy_end = 0;
 
   if ((ret = rdmsrl_safe_on_cpu(cpuid, source_reg, &raw_core_energy_begin))) {
@@ -247,8 +246,9 @@ static int calculate_power(int cpuid, uint64_t source_reg,
     return ret;
   }
 
-  *power_in_mw = (raw_core_energy_end - raw_core_energy_begin) *
-                 ENERGY_MUTLIPLIER / inverse_energy_unit_d;
+  *power_in_mw =
+      ((raw_core_energy_end - raw_core_energy_begin) * ENERGY_MUTLIPLIER) >>
+      power_unit.energy_unit;
 
   return 0;
 }
